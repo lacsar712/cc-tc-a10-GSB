@@ -1,6 +1,9 @@
 <script>
+  import Snapshots from "./Snapshots.svelte";
+
   let session = null;
   let logs = [];
+  let page = "logs";
   let loginUser = "surveyor";
   let loginPass = "surv123456";
   let chainage = "";
@@ -54,6 +57,7 @@
     if (timer) clearInterval(timer);
     session = null;
     logs = [];
+    page = "logs";
     localStorage.removeItem("tunnel_session");
   }
 
@@ -81,6 +85,8 @@
     }
   }
 
+  const STATUS_TEXT = { pending: "待办", processing: "在办", done: "已办结" };
+
   const raw = localStorage.getItem("tunnel_session");
   if (raw) {
     try {
@@ -101,6 +107,15 @@
     color: #f5f5f4;
   }
   main { max-width: 960px; margin: 0 auto; padding: 1.5rem; }
+  .topbar {
+    display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;
+    border-bottom: 1px solid #44403c; padding-bottom: 0.75rem; margin-bottom: 1.25rem;
+  }
+  .brand { color: #fbbf24; font-weight: 700; font-size: 1.15rem; }
+  nav { display: flex; gap: 0.5rem; }
+  nav button { background: transparent; color: #d6d3d1; padding: 0.35rem 0.8rem; }
+  nav button.active { background: #d97706; color: #fff; }
+  .who { margin-left: auto; color: #a8a29e; font-size: 0.85rem; display: flex; align-items: center; gap: 0.6rem; }
   h1 { color: #fbbf24; margin: 0 0 0.25rem; }
   .sub { color: #a8a29e; margin-bottom: 1.25rem; }
   section {
@@ -124,11 +139,12 @@
   .ok { background: #14532d; color: #86efac; }
   .bad { background: #7f1d1d; color: #fca5a5; }
   .pending { background: #713f12; color: #fde68a; }
+  .processing { background: #1e3a5f; color: #bfdbfe; }
 </style>
 
 <main>
-  <h1>隧道收敛测缝台</h1>
   {#if !session}
+    <h1>隧道收敛测缝台</h1>
     <p class="sub">测量员提交桩号与收敛毫米值，接口进程内线程认领后出结论。登录框已预填可写账号 surveyor / surv123456。</p>
     <section>
       <label>用户名</label>
@@ -139,43 +155,58 @@
       {#if error}<p class="err">{error}</p>{/if}
     </section>
   {:else}
-    <p class="sub">已登录：{session.username}（{isWriter ? "可提交" : "只读"}）</p>
-    <section>
-      <button class="secondary" on:click={logout}>退出</button>
-      <button class="secondary" disabled={loading} on:click={refresh}>刷新列表</button>
-    </section>
-    {#if isWriter}
+    <div class="topbar">
+      <span class="brand">隧道收敛测缝台</span>
+      <nav>
+        <button class={page === "logs" ? "active" : ""} on:click={() => (page = "logs")}>在线单据</button>
+        <button class={page === "snapshots" ? "active" : ""} on:click={() => (page = "snapshots")}>通车快照</button>
+      </nav>
+      <span class="who">
+        {session.username}（{isWriter ? "测量员·可写" : "巡检·只读"}）
+        <button class="secondary" on:click={logout}>退出</button>
+      </span>
+    </div>
+
+    {#if page === "logs"}
+      {#if isWriter}
+        <section>
+          <label for="chainage">里程桩号</label>
+          <input id="chainage" placeholder="例如 K20+050" bind:value={chainage} />
+          <label for="delta-mm">收敛（毫米，可正可负）</label>
+          <input id="delta-mm" type="number" step="0.1" bind:value={deltaMm} />
+          <button disabled={loading} on:click={submit}>提交（进入待认领）</button>
+          {#if error}<p class="err">{error}</p>{/if}
+        </section>
+      {/if}
       <section>
-        <label>里程桩号</label>
-        <input placeholder="例如 K20+050" bind:value={chainage} />
-        <label>收敛（毫米，可正可负）</label>
-        <input type="number" step="0.1" bind:value={deltaMm} />
-        <button disabled={loading} on:click={submit}>提交（进入待认领）</button>
-        {#if error}<p class="err">{error}</p>{/if}
-      </section>
-    {/if}
-    <section>
-      <table>
-        <thead>
-          <tr><th>编号</th><th>桩号</th><th>收敛mm</th><th>状态</th><th>结论</th><th>说明</th></tr>
-        </thead>
-        <tbody>
-          {#each logs as row}
-            <tr>
-              <td>{row.id}</td>
-              <td>{row.chainage}</td>
-              <td>{row.delta_mm}</td>
-              <td><span class="tag {row.status === 'pending' ? 'pending' : 'ok'}">{row.status === 'pending' ? '待处理' : '已完成'}</span></td>
-              <td>
-                {#if row.verdict}
-                  <span class="tag {row.verdict === '合格' ? 'ok' : 'bad'}">{row.verdict}</span>
-                {:else}—{/if}
-              </td>
-              <td>{row.reason ?? "—"}</td>
+        <table>
+          <thead>
+            <tr><th>编号</th><th>桩号</th><th>收敛mm</th><th>状态</th><th>结论</th><th>说明</th></tr>
+          </thead>
+          <tbody>
+            {#each logs as row}
+              <tr>
+                <td>{row.id}</td>
+                <td>{row.chainage}</td>
+                <td>{row.delta_mm}</td>
+                <td>
+                  <span class="tag {row.status === 'done' ? 'ok' : row.status === 'processing' ? 'processing' : 'pending'}">
+                    {STATUS_TEXT[row.status] || row.status}
+                  </span>
+                </td>
+                <td>
+                  {#if row.verdict}
+                    <span class="tag {row.verdict === '合格' ? 'ok' : 'bad'}">{row.verdict}</span>
+                  {:else}—{/if}
+                </td>
+                <td>{row.reason ?? "—"}</td>
             </tr>
-          {/each}
-        </tbody>
-      </table>
-    </section>
+            {/each}
+          </tbody>
+        </table>
+      </section>
+    {:else}
+      <Snapshots {session} onexpire={logout} />
+    {/if}
   {/if}
 </main>

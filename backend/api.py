@@ -5,9 +5,20 @@ from functools import wraps
 from flask import Flask, g, jsonify, request
 from jose import JWTError, jwt
 from passlib.context import CryptContext
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import joinedload
 
-from claimer import start as start_claimer
-from models import Base, ConvergenceLog, SessionLocal, engine, row_dict
+from claimer import IN_FLIGHT_STATUSES, start as start_claimer
+from models import (
+    Base,
+    ConvergenceLog,
+    SessionLocal,
+    TrafficSnapshot,
+    TrafficSnapshotItem,
+    engine,
+    row_dict,
+    snapshot_dict,
+)
 
 SECRET = os.environ.get("JWT_SECRET", "tunnelconv-dev-secret")
 pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -49,7 +60,8 @@ def seed():
 
 
 seed()
-start_claimer()
+if os.environ.get("DISABLE_CLAIMER") != "1":
+    start_claimer()
 
 
 def current_user():
@@ -85,7 +97,7 @@ def require_writer(fn):
         if user is None:
             return jsonify({"detail": "未登录"}), 401
         if user["role"] != "writer":
-            return jsonify({"detail": "仅测量员可提交收敛读数"}), 403
+            return jsonify({"detail": "巡检身份只读，不能点快照（仅测量员可写）"}), 403
         g.user = user
         return fn(*args, **kwargs)
 
@@ -147,5 +159,96 @@ def create_log():
         db.commit()
         db.refresh(row)
         return jsonify(row_dict(row)), 201
+    finally:
+        db.close()
+
+
+@app.get("/api/snapshots")
+@require_login
+def list_snapshots():
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(TrafficSnapshot)
+            .options(joinedload(TrafficSnapshot.items))
+            .order_by(TrafficSnapshot.id.desc())
+            .all()
+        )
+        return jsonify([snapshot_dict(r) for r in rows])
+    finally:
+        db.close()
+
+
+@app.get("/api/snapshots/<int:snapshot_id>")
+@require_login
+def get_snapshot(snapshot_id):
+    db = SessionLocal()
+    try:
+        row = (
+            db.query(TrafficSnapshot)
+            .options(joinedload(TrafficSnapshot.items))
+            .filter(TrafficSnapshot.id == snapshot_id)
+            .one_or_none()
+        )
+        if row is None:
+            return jsonify({"detail": "快照不存在"}), 404
+        return jsonify(snapshot_dict(row, with_items=True))
+    finally:
+        db.close()
+
+
+@app.post("/api/snapshots")
+@require_writer
+def create_snapshot():
+    body = request.get_json(silent=True) or {}
+    window_name = (body.get("window_name") or "").strip()
+    if not window_name:
+        return jsonify({"detail": "通车窗口名称不能为空"}), 400
+    db = SessionLocal()
+    try:
+        dup = (
+            db.query(TrafficSnapshot.id)
+            .filter(TrafficSnapshot.window_name == window_name)
+            .first()
+        )
+        if dup is not None:
+            return (
+                jsonify({"detail": f"通车窗口「{window_name}」快照已存在，不能覆盖新旧两套必须分清"}),
+                409,
+            )
+        # 一把行锁锁住此刻全部在途单据：认领线程在本事务提交前无法办结其中任何一笔，
+        # 保证抄进快照的集合就是这一瞬间路上的完整集合。
+        rows = (
+            db.query(ConvergenceLog)
+            .filter(ConvergenceLog.status.in_(IN_FLIGHT_STATUSES))
+            .order_by(ConvergenceLog.id)
+            .with_for_update()
+            .all()
+        )
+        if not rows:
+            return jsonify({"detail": "当前没有在途（待办/在办）测缝单，快照无明细可抄"}), 400
+        snapshot = TrafficSnapshot(
+            window_name=window_name,
+            created_by=g.user["username"],
+            created_at=datetime.now(timezone.utc),
+        )
+        for seq, r in enumerate(rows):
+            snapshot.items.append(
+                TrafficSnapshotItem(
+                    seq=seq,
+                    log_id=r.id,
+                    chainage=r.chainage,
+                    delta_mm=float(r.delta_mm),
+                    status=r.status,
+                )
+            )
+        db.add(snapshot)
+        # 头与明细在同一事务一次提交：要么整份落库，要么什么都没有，禁止只写下半截。
+        db.commit()
+        db.refresh(snapshot)
+        return jsonify(snapshot_dict(snapshot, with_items=True)), 201
+    except IntegrityError:
+        db.rollback()
+        return jsonify({"detail": "同名通车窗口快照已存在，不能覆盖"}), 409
     finally:
         db.close()
